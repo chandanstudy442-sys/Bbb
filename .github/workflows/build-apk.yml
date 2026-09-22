@@ -1,0 +1,271 @@
+name: Build and Publish APK and AAB with Package Name
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release APK + AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Temurin Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Verify Java environment
+        run: |
+          echo "=== Java Environment Verification ==="
+          java -version
+          echo "JAVA_HOME: $JAVA_HOME"
+          
+          JAVA_MAJOR=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}' | awk -F '.' '{print $1}')
+          if [ -z "$JAVA_MAJOR" ]; then
+            echo "Error: Could not detect Java major version."
+            exit 1
+          fi
+          
+          echo "Detected Java major version: $JAVA_MAJOR"
+          if [ "$JAVA_MAJOR" -lt 21 ]; then
+            echo "Error: Active Java major version ($JAVA_MAJOR) is lower than 21. AGP 9 requires Java 21."
+            exit 1
+          fi
+          echo "Java environment verified successfully: Java $JAVA_MAJOR is 21 or newer."
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Accept Android SDK Licenses
+        run: |
+          echo "=== Accepting Android SDK Licenses ==="
+          yes | sdkmanager --licenses 2>/dev/null || true
+
+      - name: Setup environment and keystore
+        run: |
+          echo "=== Setting up Build Environment ==="
+          # Ensure .env exists for Secrets Gradle plugin
+          touch .env
+
+          # Ensure debug.keystore exists
+          if [ -f "./debug.keystore" ]; then
+            echo "./debug.keystore already exists."
+          else
+            echo "./debug.keystore is missing. Generating temporary debug keystore..."
+            keytool -genkey -v \
+              -keystore ./debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          if [ ! -f "./debug.keystore" ]; then
+            echo "Error: Failed to create ./debug.keystore"
+            exit 1
+          fi
+          echo "Environment and debug keystore ready."
+
+      - name: Extract Package Name and Version
+        id: pkg_info
+        run: |
+          echo "=== Extracting Android Package Info ==="
+          PKG_NAME=$(grep -oE "applicationId\s*=\s*\"[^\"]+\"" app/build.gradle.kts | head -n1 | cut -d"\"" -f2)
+          if [ -z "$PKG_NAME" ]; then
+            PKG_NAME="com.aistudio.aiagent.phctrl"
+          fi
+
+          VERSION_NAME=$(grep -oE "versionName\s*=\s*\"[^\"]+\"" app/build.gradle.kts | head -n1 | cut -d"\"" -f2)
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME="1.0"
+          fi
+
+          VERSION_CODE=$(grep -oE "versionCode\s*=\s*[0-9]+" app/build.gradle.kts | head -n1 | awk '{print $NF}')
+          if [ -z "$VERSION_CODE" ]; then
+            VERSION_CODE="1"
+          fi
+
+          echo "Package Name: $PKG_NAME"
+          echo "Version Name: $VERSION_NAME"
+          echo "Version Code: $VERSION_CODE"
+
+          echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK and AAB Bundle
+        run: |
+          echo "=== Running Gradle Build for APK and AAB ==="
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew :app:assembleDebug :app:bundleDebug --stacktrace --no-daemon
+          else
+            gradle :app:assembleDebug :app:bundleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Verify APK and AAB Outputs
+        run: |
+          echo "=== Verifying Build Outputs ==="
+          EXPECTED_APK="app/build/outputs/apk/debug/app-debug.apk"
+          EXPECTED_AAB="app/build/outputs/bundle/debug/app-debug.aab"
+
+          if [ ! -f "$EXPECTED_APK" ]; then
+            echo "Error: Expected debug APK not found at $EXPECTED_APK"
+            exit 1
+          fi
+
+          if [ ! -f "$EXPECTED_AAB" ]; then
+            echo "Error: Expected debug AAB not found at $EXPECTED_AAB"
+            exit 1
+          fi
+
+          if [ ! -s "$EXPECTED_APK" ]; then
+            echo "Error: Expected APK file is empty."
+            exit 1
+          fi
+
+          if [ ! -s "$EXPECTED_AAB" ]; then
+            echo "Error: Expected AAB file is empty."
+            exit 1
+          fi
+
+          echo "APK Verified: $(ls -lh $EXPECTED_APK)"
+          echo "AAB Verified: $(ls -lh $EXPECTED_AAB)"
+
+      - name: Prepare Assets with Package Name
+        id: prepare_assets
+        run: |
+          echo "=== Renaming Assets with Package Name ==="
+          TEMP_DIR=$(mktemp -d -t release-assets-XXXXXX)
+          PKG="${{ steps.pkg_info.outputs.pkg_name }}"
+          VER="${{ steps.pkg_info.outputs.version_name }}"
+          RUN_NUM="${{ github.run_number }}"
+
+          APK_FILENAME="${PKG}-v${VER}-build${RUN_NUM}.apk"
+          AAB_FILENAME="${PKG}-v${VER}-build${RUN_NUM}.aab"
+
+          DEST_APK="${TEMP_DIR}/${APK_FILENAME}"
+          DEST_AAB="${TEMP_DIR}/${AAB_FILENAME}"
+
+          cp "app/build/outputs/apk/debug/app-debug.apk" "$DEST_APK"
+          cp "app/build/outputs/bundle/debug/app-debug.aab" "$DEST_AAB"
+
+          echo "Prepared APK: $DEST_APK"
+          echo "Prepared AAB: $DEST_AAB"
+
+          echo "apk_path=${DEST_APK}" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=${APK_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "aab_path=${DEST_AAB}" >> "$GITHUB_OUTPUT"
+          echo "aab_filename=${AAB_FILENAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_assets.outputs.apk_filename }}
+          path: ${{ steps.prepare_assets.outputs.apk_path }}
+          if-no-files-found: error
+
+      - name: Upload AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_assets.outputs.aab_filename }}
+          path: ${{ steps.prepare_assets.outputs.aab_path }}
+          if-no-files-found: error
+
+      - name: Publish APK and AAB to GitHub Releases
+        id: publish_release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== GitHub Releases Step ==="
+          APK_PATH="${{ steps.prepare_assets.outputs.apk_path }}"
+          AAB_PATH="${{ steps.prepare_assets.outputs.aab_path }}"
+          APK_NAME="${{ steps.prepare_assets.outputs.apk_filename }}"
+          AAB_NAME="${{ steps.prepare_assets.outputs.aab_filename }}"
+          PKG="${{ steps.pkg_info.outputs.pkg_name }}"
+          VER="${{ steps.pkg_info.outputs.version_name }}"
+
+          TAG_NAME="v${VER}-b${{ github.run_number }}-${{ github.run_attempt }}"
+          TITLE="Release v${VER} (Build #${{ github.run_number }}) - ${PKG}"
+
+          NOTES=$(cat <<EOF
+          ### 📱 Android Build Release
+          - **Package Name**: \`${PKG}\`
+          - **Version**: \`${VER}\` (Code: ${{ steps.pkg_info.outputs.version_code }})
+          - **Build Number**: #${{ github.run_number }}
+          - **Source Commit**: ${{ github.sha }}
+
+          ### 📦 Download Assets:
+          1. **APK File (Direct install on Android phone)**:
+             - File: \`${APK_NAME}\`
+          2. **AAB File (Android App Bundle for Play Store / distribution)**:
+             - File: \`${AAB_NAME}\`
+          EOF
+          )
+
+          echo "Creating GitHub Release with tag: $TAG_NAME"
+          gh release create "$TAG_NAME" \
+            "$APK_PATH" \
+            "$AAB_PATH" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            --target "${{ github.sha }}" \
+            --latest || echo "Warning: GitHub release creation failed (check repository token permissions). Artifacts are still uploaded."
+
+      - name: Report Build & Release Result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== Final Report ==="
+          PUBLISH_OUTCOME="${{ steps.publish_release.outcome }}"
+          PKG="${{ steps.pkg_info.outputs.pkg_name }}"
+          VER="${{ steps.pkg_info.outputs.version_name }}"
+          APK_NAME="${{ steps.prepare_assets.outputs.apk_filename }}"
+          AAB_NAME="${{ steps.prepare_assets.outputs.aab_filename }}"
+          TAG_NAME="v${VER}-b${{ github.run_number }}-${{ github.run_attempt }}"
+
+          if [ "$PUBLISH_OUTCOME" = "success" ]; then
+            RELEASE_URL=$(gh release view "$TAG_NAME" --json url -q .url 2>/dev/null || echo "")
+            {
+              echo "## 🚀 Android Build & Release Successful"
+              echo "✅ **Package Name**: \`$PKG\`"
+              echo "✅ **Version**: \`$VER\`"
+              echo ""
+              echo "### 📦 Generated Files:"
+              echo "- **APK (Direct Install)**: \`$APK_NAME\`"
+              echo "- **AAB (App Bundle)**: \`$AAB_NAME\`"
+              echo ""
+              if [ -n "$RELEASE_URL" ]; then
+                echo "🔗 **GitHub Release Link**: [$RELEASE_URL]($RELEASE_URL)"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## 📦 Android Build Summary"
+              echo "✅ **APK & AAB Built Successfully!**"
+              echo "- **Package Name**: \`$PKG\`"
+              echo "- **APK File**: \`$APK_NAME\`"
+              echo "- **AAB File**: \`$AAB_NAME\`"
+              echo ""
+              echo "Both files are available under GitHub Actions **Artifacts**."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
